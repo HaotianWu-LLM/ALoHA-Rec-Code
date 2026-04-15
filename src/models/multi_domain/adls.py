@@ -1,11 +1,13 @@
 """
 ALoHA-Rec: Asymmetric-aware Low-rank Hierarchical Adaptation for Multi-Domain Recommendation
 
-Changes vs original:
-  1. Added domain_towers (nn.ModuleList of MLP) for domain-specific prediction heads
-  2. forward() now uses backbone return_features=True + domain tower routing
-  3. set_training_stage(2) also freezes domain_towers
-  4. initialize_benefit_matrix: gradient extraction from backbone_layers[-1] (last shared layer)
+Key design decisions:
+  - Routers: single-layer linear (paper Eq.9 / Eq.15)
+  - GABA: parameter-space gradients from last backbone layer (paper Eq.4)
+  - Stage 1 forward:
+      EPNet  → backbone's shared output_layer (matches standalone EPNet exactly)
+      Others → domain-specific towers
+  - Stage 2: all backbones use domain towers + LoRA routing
 """
 
 import torch
@@ -96,27 +98,18 @@ class ADLS(nn.Module):
         nn.init.normal_(self.layer_positions, mean=0.0, std=0.01)
 
         router_input_dim = self.domain_hidden_dim + self.layer_position_dim
-        self.inter_layer_router = nn.Sequential(
-            nn.Linear(router_input_dim, 64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 1)
-        )
 
-        self.intra_layer_router = nn.Sequential(
-            nn.Linear(router_input_dim, 64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, num_experts)
-        )
+        # --- Single-layer routers (paper Eq.9 and Eq.15) ---
+        # Inter-layer: s_{l,m} = w_L^T [p_l; h'_m] + b_L
+        self.inter_layer_router = nn.Linear(router_input_dim, 1)
+        nn.init.xavier_uniform_(self.inter_layer_router.weight)
+        nn.init.zeros_(self.inter_layer_router.bias)
 
-        for m in list(self.inter_layer_router.modules()) + list(self.intra_layer_router.modules()):
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        # Intra-layer: r^(e)_{l,m} = (w^(e)_E)^T [p_l; h'_m] + b^(e)_E
+        # A single Linear(dim, num_experts) is equivalent to per-expert projections
+        self.intra_layer_router = nn.Linear(router_input_dim, num_experts)
+        nn.init.xavier_uniform_(self.intra_layer_router.weight)
+        nn.init.zeros_(self.intra_layer_router.bias)
 
         self.lora_experts = nn.ModuleList()
         for cfg in self.lora_configs:
@@ -207,8 +200,37 @@ class ADLS(nn.Module):
                 param.requires_grad = False
             for param in self.embedding.parameters():
                 param.requires_grad = False
-            for param in self.domain_towers.parameters():
-                param.requires_grad = False
+            if self.backbone_type != 'epnet':
+                # Non-EPNet: towers were trained in Stage 1, freeze them
+                for param in self.domain_towers.parameters():
+                    param.requires_grad = False
+            # EPNet: towers were unused in Stage 1, keep them trainable
+
+    def init_domain_towers_from_backbone(self):
+        """Copy backbone output_layer weights to domain towers (EPNet only).
+        For EPNet tower_dims=[], both are Linear(feature_dim, 1) so shapes match."""
+        src = self.backbone.output_layer
+        for tower in self.domain_towers:
+            last_linear = None
+            if hasattr(tower, 'mlp'):
+                for m in tower.mlp.modules():
+                    if isinstance(m, nn.Linear):
+                        last_linear = m
+            if last_linear is not None and last_linear.weight.shape == src.weight.shape:
+                last_linear.weight.data.copy_(src.weight.data)
+                if last_linear.bias is not None and src.bias is not None:
+                    last_linear.bias.data.copy_(src.bias.data)
+
+    def get_stage1_params(self):
+        """Return parameters for Stage 1 optimizer."""
+        stage1_params = []
+        stage1_params.extend(self.embedding.parameters())
+        stage1_params.extend(self.backbone.parameters())
+        if self.backbone_type != 'epnet':
+            # Non-EPNet: towers participate in Stage 1
+            stage1_params.extend(self.domain_towers.parameters())
+        # EPNet: towers excluded (unused in Stage 1)
+        return stage1_params
 
     def _safe_normalize(self, x, dim=-1, eps=1e-8):
         x_sum = x.sum(dim=dim, keepdim=True)
@@ -238,18 +260,36 @@ class ADLS(nn.Module):
             input_emb = torch.nan_to_num(input_emb, nan=0.0)
 
         if self.training_stage == 1:
+            lora_args = dict(emb_3d=emb_3d, domain_id=domain_id)
             if self.train_lora_in_stage1 and self.stage1_lora_mode == 'uniform':
-                features, aux_logit = self.backbone.forward_with_lora_experts(
-                    input_emb, self.lora_experts,
-                    mode='uniform', num_experts=self.num_experts,
-                    emb_3d=emb_3d, return_features=True, domain_id=domain_id
+                lora_args.update(mode='uniform', num_experts=self.num_experts)
+                lora_module = self.lora_experts
+            else:
+                lora_args.update(mode='none')
+                lora_module = None
+
+            if self.backbone_type == 'epnet':
+                # EPNet: use backbone's own shared output_layer to match standalone
+                logits = self.backbone.forward_with_lora_experts(
+                    input_emb, lora_module,
+                    return_features=False, **lora_args
                 )
             else:
+                # Other backbones: use domain towers in Stage 1
                 features, aux_logit = self.backbone.forward_with_lora_experts(
-                    input_emb, None, mode='none',
-                    emb_3d=emb_3d, return_features=True, domain_id=domain_id
+                    input_emb, lora_module,
+                    return_features=True, **lora_args
                 )
+                B = features.shape[0]
+                logits = torch.zeros(B, device=features.device)
+                for d in range(self.domain_num):
+                    mask = (domain_id == d)
+                    if mask.any():
+                        tower_out = self.domain_towers[d](features[mask])
+                        logits[mask] = tower_out.squeeze(-1)
+                logits = logits + aux_logit
         else:
+            # Stage 2: all backbones use domain towers + LoRA routing
             domain_emb = self.domain_embeddings(domain_id)
             zeta, alpha = self.hierarchical_routing(domain_emb, domain_id)
             features, aux_logit = self.backbone.forward_with_lora_experts(
@@ -258,16 +298,15 @@ class ADLS(nn.Module):
                 emb_3d=emb_3d, return_features=True, domain_id=domain_id
             )
 
-        # --- Domain-specific tower routing ---
-        B = features.shape[0]
-        logits = torch.zeros(B, device=features.device)
-        for d in range(self.domain_num):
-            mask = (domain_id == d)
-            if mask.any():
-                tower_out = self.domain_towers[d](features[mask])
-                logits[mask] = tower_out.squeeze(-1)
+            B = features.shape[0]
+            logits = torch.zeros(B, device=features.device)
+            for d in range(self.domain_num):
+                mask = (domain_id == d)
+                if mask.any():
+                    tower_out = self.domain_towers[d](features[mask])
+                    logits[mask] = tower_out.squeeze(-1)
 
-        logits = logits + aux_logit
+            logits = logits + aux_logit
 
         if torch.isnan(logits).any():
             logits = torch.nan_to_num(logits, nan=0.0)
@@ -367,12 +406,7 @@ class ADLS(nn.Module):
             self.gradient_count[domain_id] += 1
 
     def compute_asymmetric_benefit_score(self, g_target, g_source, eps=1e-8):
-        """Asymmetric benefit of source j to target m.
-
-        Computes relu(dot(g_j, g_m) / ||g_j||) = relu(||g_m|| * cos(theta)).
-        Asymmetry: depends on ||g_m|| (target magnitude), not ||g_j||.
-        NOT cosine similarity (which would be symmetric).
-        """
+        """Paper Eq.(4): rho_{m<-j} = relu(g_j^T g_m / ||g_j||)"""
         g_source_norm = torch.norm(g_source)
         if g_source_norm < eps:
             return torch.tensor(0.0, device=g_target.device)
@@ -380,14 +414,7 @@ class ADLS(nn.Module):
         return F.relu(projection)
 
     def compute_benefit_matrix_from_ema(self):
-        """Compute asymmetric benefit matrix R from EMA gradients.
-
-        Paper Eq.(4): rho[m,j] = relu(dot(g_j, g_m) / ||g_j||)  for j != m
-        Paper Eq.(5): rho_self[m] = beta * rho_self[m] + (1-beta) * S_bar
-                      ("the less others can help me, the more I should help myself")
-        Paper Eq.(6): R[m,j] = rho[m,j] / Z_m,  Z_m = rho_self[m] + S_m
-                      Rows sum to 1 by construction.
-        """
+        """Paper Eq.(4)-(6): Compute R^(0) from EMA gradients."""
         if not self.ema_initialized or self.ema_gradients is None:
             return self.R_benefit
 
@@ -401,28 +428,23 @@ class ADLS(nn.Module):
             g_m = self.ema_gradients[m]
             if torch.norm(g_m) < eps:
                 continue
-
             for j in range(D):
                 if m != j:
                     g_j = self.ema_gradients[j]
                     if torch.norm(g_j) > eps:
                         rho[m, j] = self.compute_asymmetric_benefit_score(g_m, g_j)
 
-        # Eq.(5): EMA-scaled self-reliance
         S = rho.sum(dim=1)
         S_bar = S.mean().item()
 
         for m in range(D):
             self.rho_self[m] = self.beta * self.rho_self[m] + (1 - self.beta) * S_bar
 
-        # Eq.(6): Row-normalized benefit matrix
         R = torch.zeros(D, D, device=device)
-
         for m in range(D):
             rho_m = self.rho_self[m].item()
             S_m = S[m].item()
             Z_m = rho_m + S_m
-
             if Z_m > eps:
                 R[m, m] = rho_m / Z_m
                 for j in range(D):
@@ -442,83 +464,8 @@ class ADLS(nn.Module):
     def get_benefit_matrix(self):
         return self.R_benefit.clone()
 
-    def _js_divergence(self, p, q, eps=1e-8):
-        p = torch.clamp(p, min=eps, max=1-eps)
-        q = torch.clamp(q, min=eps, max=1-eps)
-        p = p / p.sum()
-        q = q / q.sum()
-        m = (p + q) / 2
-
-        kl_pm = (p * (p / m).log()).sum()
-        kl_qm = (q * (q / m).log()).sum()
-
-        return 0.5 * (kl_pm + kl_qm)
-
-    def compute_mutual_loss(self, phi, domain_ids):
-        unique_domains = torch.unique(domain_ids)
-        if len(unique_domains) < 2:
-            return torch.tensor(0.0, device=phi.device, requires_grad=True)
-
-        R_gated = self.compute_gated_R()
-        loss = torch.tensor(0.0, device=phi.device)
-        count = 0
-
-        for i, di in enumerate(unique_domains):
-            for j, dj in enumerate(unique_domains):
-                if i < j:
-                    mask_i = (domain_ids == di)
-                    mask_j = (domain_ids == dj)
-
-                    if mask_i.sum() > 0 and mask_j.sum() > 0:
-                        phi_i = phi[mask_i].mean(dim=0)
-                        phi_j = phi[mask_j].mean(dim=0)
-
-                        r_ij = R_gated[di, dj]
-                        r_ji = R_gated[dj, di]
-                        M_ij = torch.min(r_ij, r_ji)
-
-                        js_div = self._js_divergence(phi_i, phi_j)
-                        loss = loss + M_ij * js_div
-                        count += 1
-
-        if count == 0:
-            return torch.tensor(0.0, device=phi.device, requires_grad=True)
-
-        return loss / count
-
-    def compute_separation_loss(self, phi, domain_ids):
-        unique_domains = torch.unique(domain_ids)
-        if len(unique_domains) < 2:
-            return torch.tensor(0.0, device=phi.device, requires_grad=True)
-
-        R_gated = self.compute_gated_R()
-        loss = torch.tensor(0.0, device=phi.device)
-        count = 0
-
-        for i, di in enumerate(unique_domains):
-            for j, dj in enumerate(unique_domains):
-                if i < j:
-                    mask_i = (domain_ids == di)
-                    mask_j = (domain_ids == dj)
-
-                    if mask_i.sum() > 0 and mask_j.sum() > 0:
-                        phi_i = phi[mask_i].mean(dim=0)
-                        phi_j = phi[mask_j].mean(dim=0)
-
-                        r_ij = R_gated[di, dj]
-                        r_ji = R_gated[dj, di]
-                        M_ij = torch.min(r_ij, r_ji)
-
-                        overlap = torch.abs(phi_i * phi_j).sum()
-                        loss = loss + (1.0 - M_ij) * overlap
-                        count += 1
-
-        if count == 0:
-            return torch.tensor(0.0, device=phi.device, requires_grad=True)
-
-        return loss / count
-
     def compute_directional_loss(self, phi, domain_ids):
+        """Paper Eq.(13)-(14): Asymmetric routing alignment."""
         unique_domains = torch.unique(domain_ids)
         if len(unique_domains) < 2:
             return torch.tensor(0.0, device=phi.device, requires_grad=True)
@@ -561,8 +508,16 @@ class ADLS(nn.Module):
         return loss / count
 
     def initialize_benefit_matrix(self, train_loader, device, max_batches=50):
+        """Initialize R^(0) using parameter-space gradients from last backbone layer."""
         self.eval()
         criterion = nn.BCEWithLogitsLoss()
+
+        target_params = [p for p in self.backbone.backbone_layers[-1].parameters()]
+        if not target_params:
+            self.train()
+            return self.R_benefit
+
+        is_epnet = (self.backbone_type == 'epnet')
 
         for batch_idx, (x_dict, y) in enumerate(train_loader):
             if batch_idx >= max_batches:
@@ -572,42 +527,49 @@ class ADLS(nn.Module):
             y = y.to(device)
             domain_ids = x_dict["domain_indicator"].long()
 
-            with torch.no_grad():
-                input_emb = self.embedding(x_dict, self.features, squeeze_dim=True)
-                emb_3d = self.embedding(x_dict, self.features, squeeze_dim=False)
-                if input_emb.dim() == 1:
-                    input_emb = input_emb.unsqueeze(0)
-                if emb_3d.dim() == 2:
-                    emb_3d = emb_3d.unsqueeze(0)
+            input_emb = self.embedding(x_dict, self.features, squeeze_dim=True)
+            emb_3d = self.embedding(x_dict, self.features, squeeze_dim=False)
+            if input_emb.dim() == 1:
+                input_emb = input_emb.unsqueeze(0)
+            if emb_3d.dim() == 2:
+                emb_3d = emb_3d.unsqueeze(0)
 
-                features_raw, aux_logit = self.backbone.forward_with_lora_experts(
+            if is_epnet:
+                logits = self.backbone.forward_with_lora_experts(
+                    input_emb, None, mode='none',
+                    emb_3d=emb_3d, return_features=False, domain_id=domain_ids
+                )
+            else:
+                features, aux_logit = self.backbone.forward_with_lora_experts(
                     input_emb, None, mode='none',
                     emb_3d=emb_3d, return_features=True, domain_id=domain_ids
                 )
 
-            features = features_raw.detach().requires_grad_(True)
-            aux_logit = aux_logit.detach()
-
-            for d in torch.unique(domain_ids):
+            unique_domains = torch.unique(domain_ids)
+            for idx, d in enumerate(unique_domains):
                 mask = (domain_ids == d)
                 if mask.sum() < 2:
                     continue
-
                 d_int = int(d.item())
                 if d_int >= self.domain_num:
                     continue
 
-                tower_out = self.domain_towers[d_int](features[mask]).squeeze(-1)
-                d_logits = tower_out + aux_logit[mask]
-                loss = criterion(d_logits, y[mask].float())
+                if is_epnet:
+                    loss = criterion(logits[mask], y[mask].float())
+                else:
+                    tower_out = self.domain_towers[d_int](features[mask]).squeeze(-1)
+                    d_logits = tower_out + aux_logit[mask]
+                    loss = criterion(d_logits, y[mask].float())
 
                 if torch.isnan(loss):
                     continue
 
-                feat_grad = torch.autograd.grad(
-                    loss, features, retain_graph=True, create_graph=False
-                )[0]
-                domain_grad = feat_grad[mask].mean(dim=0).detach()
+                is_last = (idx == len(unique_domains) - 1)
+                grads = torch.autograd.grad(
+                    loss, target_params,
+                    retain_graph=not is_last, create_graph=False
+                )
+                domain_grad = torch.cat([g.detach().flatten() for g in grads])
 
                 if not torch.isnan(domain_grad).any() and torch.norm(domain_grad) > 1e-10:
                     self.update_ema_gradients(d_int, domain_grad)

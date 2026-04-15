@@ -1,12 +1,12 @@
 """
 ALoHA-Rec Two-Stage Trainer
-Paper-aligned implementation with epoch-level alternating optimization.
 
-Changes vs original:
-  1. train_stage1: per-domain loss averaging instead of single BCE on full batch
-  2. train_stage2 Phase-W: per-domain loss averaging for consistency
-  3. _collect_domain_gradients: extract from backbone_layers[-1] (last shared layer),
-     proper zero_grad per domain, removed retain_graph
+Changes vs previous version:
+  1. _collect_domain_gradients: parameter-space gradients from last backbone layer
+     (paper Eq.4 requires nabla_W L_m, not nabla_h L_m)
+  2. train_stage1: per-domain averaged loss (paper Eq.3)
+  3. train_stage1: optimizer only includes Stage 1 relevant params
+     (excludes LoRA experts, routers, etc.)
 """
 
 import os
@@ -66,7 +66,7 @@ class CosineAnnealingWarmupScheduler:
 
 
 def _compute_multidomain_loss(criterion, logits, y, domain_ids):
-    """Compute per-domain averaged loss."""
+    """Paper Eq.(3): per-domain averaged loss L_pre = (1/M) sum_m E[l(f(x,m), y)]."""
     loss = torch.tensor(0.0, device=logits.device)
     n_domains = 0
     for d in torch.unique(domain_ids):
@@ -179,13 +179,10 @@ class ALoHATrainer:
         return results
 
     def _collect_domain_gradients(self, x_dict, y, criterion=None):
-        """Collect per-domain feature-level gradients for GABA benefit computation.
+        """Collect per-domain PARAMETER-SPACE gradients for GABA (paper Eq.4).
 
-        Completely isolated from training:
-        - Model set to eval (no dropout noise, BN uses running stats)
-        - Backbone forward under torch.no_grad (no graph, no side effects)
-        - Features detached and re-grad-enabled for tower-only gradient
-        - Gradient = d(L_d)/d(features), direction each domain wants shared features to move
+        EPNet: uses backbone's shared output_layer (matching standalone).
+        Others: uses domain towers (matching their Stage 1 forward path).
         """
         if criterion is None:
             criterion = self.criterion
@@ -196,51 +193,60 @@ class ALoHATrainer:
         was_training = self.model.training
         self.model.eval()
 
-        with torch.no_grad():
-            input_emb = self.model.embedding(x_dict, self.model.features, squeeze_dim=True)
-            emb_3d = self.model.embedding(x_dict, self.model.features, squeeze_dim=False)
-            if input_emb.dim() == 1:
-                input_emb = input_emb.unsqueeze(0)
-            if emb_3d.dim() == 2:
-                emb_3d = emb_3d.unsqueeze(0)
+        last_layer = self.model.backbone.backbone_layers[-1]
+        target_params = [p for p in last_layer.parameters()]
+        if not target_params:
+            self.model.train(was_training)
+            return domain_gradients
 
-            lora_kwargs = dict(mode='none', emb_3d=emb_3d, return_features=True, domain_id=domain_ids)
-            if (self.model.training_stage == 1 and self.model.train_lora_in_stage1
-                    and self.model.stage1_lora_mode == 'uniform'):
-                lora_kwargs['mode'] = 'uniform'
-                lora_kwargs['num_experts'] = self.model.num_experts
-                features_raw, aux_logit = self.model.backbone.forward_with_lora_experts(
-                    input_emb, self.model.lora_experts, **lora_kwargs
-                )
-            else:
-                features_raw, aux_logit = self.model.backbone.forward_with_lora_experts(
-                    input_emb, None, **lora_kwargs
-                )
+        input_emb = self.model.embedding(x_dict, self.model.features, squeeze_dim=True)
+        emb_3d = self.model.embedding(x_dict, self.model.features, squeeze_dim=False)
+        if input_emb.dim() == 1:
+            input_emb = input_emb.unsqueeze(0)
+        if emb_3d.dim() == 2:
+            emb_3d = emb_3d.unsqueeze(0)
 
-        features = features_raw.detach().requires_grad_(True)
-        aux_logit = aux_logit.detach()
+        is_epnet = (self.model.backbone_type == 'epnet')
 
-        for d in torch.unique(domain_ids):
+        if is_epnet:
+            # EPNet: backbone's own output_layer
+            logits = self.model.backbone.forward_with_lora_experts(
+                input_emb, None, mode='none',
+                emb_3d=emb_3d, return_features=False, domain_id=domain_ids
+            )
+        else:
+            # Others: backbone features → domain towers
+            features, aux_logit = self.model.backbone.forward_with_lora_experts(
+                input_emb, None, mode='none',
+                emb_3d=emb_3d, return_features=True, domain_id=domain_ids
+            )
+
+        unique_domains = torch.unique(domain_ids)
+        for idx, d in enumerate(unique_domains):
             mask = (domain_ids == d)
             if mask.sum() < 2:
                 continue
-
             d_int = int(d.item())
             if d_int >= self.model.domain_num:
                 continue
 
-            tower_out = self.model.domain_towers[d_int](features[mask]).squeeze(-1)
-            d_logits = tower_out + aux_logit[mask]
-            loss = criterion(d_logits, y[mask].float())
+            if is_epnet:
+                loss = criterion(logits[mask], y[mask].float())
+            else:
+                tower_out = self.model.domain_towers[d_int](features[mask]).squeeze(-1)
+                d_logits = tower_out + aux_logit[mask]
+                loss = criterion(d_logits, y[mask].float())
 
             if torch.isnan(loss):
                 continue
 
-            feat_grad = torch.autograd.grad(
-                loss, features, retain_graph=True, create_graph=False
-            )[0]
-
-            domain_grad = feat_grad[mask].mean(dim=0).detach()
+            is_last = (idx == len(unique_domains) - 1)
+            grads = torch.autograd.grad(
+                loss, target_params,
+                retain_graph=not is_last,
+                create_graph=False
+            )
+            domain_grad = torch.cat([g.detach().flatten() for g in grads])
 
             if not torch.isnan(domain_grad).any() and torch.norm(domain_grad) > 1e-10:
                 domain_gradients[d_int] = domain_grad
@@ -255,8 +261,11 @@ class ALoHATrainer:
 
         self.model.set_training_stage(1)
 
+        # Only optimize Stage 1 relevant parameters
+        # (embedding + backbone + domain_towers, excludes LoRA/routers/gates)
+        stage1_params = self.model.get_stage1_params()
         optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            stage1_params,
             lr=self.stage1_config['lr'],
             weight_decay=self.stage1_config['weight_decay']
         )
@@ -298,12 +307,15 @@ class ALoHATrainer:
 
                 optimizer.zero_grad()
                 logits = self.model(x_dict)
-                loss = criterion(logits, y.float())
+
+                # Paper Eq.(3): per-domain averaged loss
+                domain_ids = x_dict["domain_indicator"].long()
+                loss = _compute_multidomain_loss(criterion, logits, y, domain_ids)
 
                 loss.backward()
 
                 torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
+                    stage1_params,
                     self.stage1_config['gradient_clip']
                 )
                 optimizer.step()
@@ -399,14 +411,12 @@ class ALoHATrainer:
         R_np = R.detach().cpu().numpy()
         D = R_np.shape[0]
 
-        # Full matrix
         header = "       " + "  ".join([f"D{j:>5d}" for j in range(D)])
         print(header)
         for i in range(D):
             row = f"  D{i:<3d}" + "  ".join([f"{R_np[i, j]:7.4f}" for j in range(D)])
             print(row)
 
-        # Summary stats
         print(f"\n  Diagonal (self-reliance): {np.diag(R_np).round(4)}")
         print(f"  Row sums: {R_np.sum(axis=1).round(4)}")
         off_diag = R_np[~np.eye(D, dtype=bool)]
@@ -415,7 +425,6 @@ class ALoHATrainer:
         print("-"*60 + "\n")
 
     def _print_ema_gradient_diagnostics(self):
-        """Print EMA gradient norms and pairwise cosine similarities for debugging."""
         if not self.model.ema_initialized or self.model.ema_gradients is None:
             print("[GABA] EMA gradients not initialized.")
             return
@@ -448,12 +457,10 @@ class ALoHATrainer:
         print("-"*60 + "\n")
 
     def _print_and_save_gated_R(self, artifact_dir=None):
-        """Print the effective gated R matrix from Stage 2 (best checkpoint)."""
         R_gated = self.model.compute_gated_R()
         self._print_benefit_matrix_summary(
             R_gated, title="Stage 2 Effective Gated R  (R_benefit * softplus(gate))"
         )
-        # Also print raw gate logits for interpretability
         gate_np = self.model.relation_gate_logits.detach().cpu().numpy()
         D = gate_np.shape[0]
         print("-"*60)
@@ -473,7 +480,6 @@ class ALoHATrainer:
         return R_gated
 
     def _write_matrix_to_file(self, f, R, title):
-        """Write a full D×D matrix to an open file handle."""
         R_np = R.detach().cpu().numpy()
         D = R_np.shape[0]
         f.write(f"\n{title}:\n")
@@ -520,13 +526,14 @@ class ALoHATrainer:
         return domain_loaders
 
     def _set_phase_w_trainable(self):
+        is_epnet = (self.model.backbone_type == 'epnet')
         for name, param in self.model.named_parameters():
             if 'backbone' in name:
                 param.requires_grad = False
             elif 'embedding' in name and 'domain' not in name:
                 param.requires_grad = False
             elif 'domain_towers' in name:
-                param.requires_grad = False
+                param.requires_grad = is_epnet
             elif 'inter_layer_router' in name:
                 param.requires_grad = True
             elif 'intra_layer_router' in name:
@@ -543,13 +550,14 @@ class ALoHATrainer:
                 param.requires_grad = False
 
     def _set_phase_h_trainable(self):
+        is_epnet = (self.model.backbone_type == 'epnet')
         for name, param in self.model.named_parameters():
             if 'backbone' in name:
                 param.requires_grad = False
             elif 'embedding' in name and 'domain' not in name:
                 param.requires_grad = False
             elif 'domain_towers' in name:
-                param.requires_grad = False
+                param.requires_grad = is_epnet
             elif 'inter_layer_router' in name:
                 param.requires_grad = False
             elif 'intra_layer_router' in name:
@@ -567,6 +575,13 @@ class ALoHATrainer:
 
     def _create_phase_w_optimizer(self):
         param_groups = []
+
+        # EPNet: towers are trainable in Stage 2
+        tower_params = [p for n, p in self.model.named_parameters()
+                        if 'domain_towers' in n and p.requires_grad]
+        if tower_params:
+            param_groups.append({'params': tower_params,
+                                'lr': self.stage2_config['lr_lora']})
 
         inter_router_params = [p for n, p in self.model.named_parameters()
                                if 'inter_layer_router' in n and p.requires_grad]
@@ -592,6 +607,13 @@ class ALoHATrainer:
 
     def _create_phase_h_optimizer(self):
         param_groups = []
+
+        # EPNet: towers are trainable in Stage 2
+        tower_params = [p for n, p in self.model.named_parameters()
+                        if 'domain_towers' in n and p.requires_grad]
+        if tower_params:
+            param_groups.append({'params': tower_params,
+                                'lr': self.stage2_config['lr_lora']})
 
         intra_router_params = [p for n, p in self.model.named_parameters()
                                if 'intra_layer_router' in n and p.requires_grad]
@@ -620,6 +642,11 @@ class ALoHATrainer:
 
         if self.best_R_benefit is not None:
             self.model.set_benefit_matrix(self.best_R_benefit)
+
+        # EPNet: towers were unused in Stage 1, initialize from backbone output_layer
+        if self.model.backbone_type == 'epnet':
+            self.model.init_domain_towers_from_backbone()
+            print("  EPNet: initialized domain towers from backbone output_layer")
 
         domain_loaders = self._build_domain_dataloaders(train_loader)
         print(f"  Built domain-specific loaders for {len(domain_loaders)} domains")
@@ -660,7 +687,6 @@ class ALoHATrainer:
                     optimizer.zero_grad()
                     logits = self.model(x_dict)
 
-                    # Multi-domain loss
                     domain_ids = x_dict["domain_indicator"].long()
                     task_loss = _compute_multidomain_loss(criterion, logits, y, domain_ids)
 
@@ -746,7 +772,6 @@ class ALoHATrainer:
         if best_model_weights is not None:
             self.model.load_state_dict(best_model_weights)
 
-        # Print both the original R_benefit and the learned gated R
         self._print_benefit_matrix_summary(
             self.model.R_benefit, title="Stage 2 R_benefit (from Stage 1, frozen)"
         )
@@ -820,7 +845,6 @@ class ALoHATrainer:
                 delta = stage2_metrics['test_auc'] - stage1_metrics['test_auc']
                 f.write(f"Delta AUC: {delta:+.6f} ({delta/stage1_metrics['test_auc']*100:+.2f}%)\n")
 
-            # Write R matrices
             f.write("\n" + "-"*40 + "\n")
             f.write("BENEFIT MATRICES\n")
             f.write("-"*40 + "\n")
