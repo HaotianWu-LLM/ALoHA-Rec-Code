@@ -42,23 +42,66 @@ def get_amazon_data_dict(data_path):
     return dense_feas, sparse_feas, domain_feat, x, y, domain_num
 
 
-def run_single(framework, extractor, dataset_path, epoch, lr, batch_size,
-               weight_decay, device, save_dir, seed, stage2_epoch):
+def get_extractor_hparams(framework, extractor):
+    """Per-extractor overrides. Non-FCN extractors have ~10-100x more parameters
+    than FCN and need tighter regularization + earlier stopping to avoid
+    overfitting on top of PEP gating, which is already a strong personalization
+    mechanism."""
+    if extractor == 'fcn':
+        if framework == 'sharedbottom':
+            return {
+                'bottom_dims': [128], 'bottom_dropout': 0.0,
+                'tower_dims': [8],
+                'lr': 1e-3, 'weight_decay': 1e-5, 'patience': 5,
+            }
+        else:
+            return {
+                'bottom_dims': [128, 64, 32], 'bottom_dropout': 0.0,
+                'tower_dims': None,
+                'lr': 1e-3, 'weight_decay': 1e-5, 'patience': 5,
+            }
+
+    if framework == 'sharedbottom':
+        return {
+            'bottom_dims': [64, 32], 'bottom_dropout': 0.0,
+            'tower_dims': [8],
+            'lr': 1e-3, 'weight_decay': 1e-4, 'patience': 2,
+        }
+    else:
+        return {
+            'bottom_dims': [64, 32], 'bottom_dropout': 0.0,
+            'tower_dims': None,
+            'lr': 1e-3, 'weight_decay': 1e-4, 'patience': 2,
+        }
+
+
+def run_single(framework, extractor, dataset_path, epoch, batch_size,
+               device, save_dir, seed, stage2_epoch,
+               lr_override=None, wd_override=None, patience_override=None):
     torch.manual_seed(seed)
     dataset_name = "amazon_5_core"
 
     dense_feas, sparse_feas, domain_feat, x, y, domain_num = get_amazon_data_dict(dataset_path)
 
+    hp = get_extractor_hparams(framework, extractor)
+    lr = lr_override if lr_override is not None else hp['lr']
+    weight_decay = wd_override if wd_override is not None else hp['weight_decay']
+    patience = patience_override if patience_override is not None else hp['patience']
+
     if framework == 'sharedbottom':
         features = dense_feas + sparse_feas
-        bottom_params = {"dims": [128]}
-        tower_params = {"dims": [8]}
+        bottom_params = {"dims": hp['bottom_dims'], "dropout": hp['bottom_dropout']}
+        tower_params = {"dims": hp['tower_dims']}
     elif framework == 'epnet':
         features = [domain_feat] + sparse_feas + dense_feas
-        bottom_params = {"dims": [128, 64, 32]}
+        bottom_params = {"dims": hp['bottom_dims'], "dropout": hp['bottom_dropout']}
         tower_params = None
     else:
         raise ValueError(f"Unknown framework: {framework}")
+
+    print(f"[{framework}/{extractor}] bottom_dims={hp['bottom_dims']} "
+          f"dropout={hp['bottom_dropout']} lr={lr} wd={weight_decay} "
+          f"patience={patience}")
 
     dg = DataGenerator(x, y)
     train_dl, val_dl, test_dl = dg.generate_dataloader(
@@ -75,7 +118,7 @@ def run_single(framework, extractor, dataset_path, epoch, lr, batch_size,
     trainer = ALoHATrainer(
         model=model, data_set_type=dataset_name, device=device, model_path=save_dir,
         stage1_lr=lr, stage1_weight_decay=weight_decay,
-        stage1_n_epoch=epoch, stage1_earlystop_patience=5,
+        stage1_n_epoch=epoch, stage1_earlystop_patience=patience,
         stage1_scheduler_step=4, stage1_scheduler_gamma=0.95,
         stage2_n_epoch=stage2_epoch,
     )
@@ -112,9 +155,13 @@ def main():
                         choices=['fcn', 'dcn', 'deepfm', 'xdeepfm', 'autoint', 'all'])
     parser.add_argument('--epoch', type=int, default=100)
     parser.add_argument('--stage2_epoch', type=int, default=20)
-    parser.add_argument('--learning_rate', type=float, default=1e-3)
+    parser.add_argument('--learning_rate', type=float, default=None,
+                        help='Override extractor-specific lr when set.')
+    parser.add_argument('--weight_decay', type=float, default=None,
+                        help='Override extractor-specific weight_decay when set.')
+    parser.add_argument('--patience', type=int, default=None,
+                        help='Override extractor-specific earlystop patience when set.')
     parser.add_argument('--batch_size', type=int, default=4096)
-    parser.add_argument('--weight_decay', type=float, default=1e-5)
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--save_dir', default='./ckpt')
     parser.add_argument('--seed', type=int, default=2022)
@@ -129,10 +176,13 @@ def main():
             run_single(
                 framework=fw, extractor=ex,
                 dataset_path=args.dataset_path,
-                epoch=args.epoch, lr=args.learning_rate,
-                batch_size=args.batch_size, weight_decay=args.weight_decay,
+                epoch=args.epoch,
+                batch_size=args.batch_size,
                 device=args.device, save_dir=args.save_dir,
                 seed=args.seed, stage2_epoch=args.stage2_epoch,
+                lr_override=args.learning_rate,
+                wd_override=args.weight_decay,
+                patience_override=args.patience,
             )
 
 

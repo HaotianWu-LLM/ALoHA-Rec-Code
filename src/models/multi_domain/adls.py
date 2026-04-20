@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .adls_backbones import SharedBottomFramework, EPNetFramework
+from .sharebottom import SharedBottom
+from .epnet import EPNet
 
 
 class _LoRAModule(nn.Module):
@@ -35,16 +36,32 @@ class ADLS(nn.Module):
         self.ema_decay = ema_decay
 
         if self.framework_name == 'sharedbottom':
-            self.framework = SharedBottomFramework(
-                features, domain_num, extractor=extractor,
-                bottom_params=bottom_params, tower_params=tower_params,
-                **extractor_kwargs
+            bp = bottom_params if bottom_params is not None else {"dims": [128]}
+            tp = tower_params if tower_params is not None else {"dims": [8]}
+            self.framework = SharedBottom(
+                features=features,
+                domain_num=domain_num,
+                bottom_params=bp,
+                tower_params=tp,
+                extractor=extractor,
+                **extractor_kwargs,
             )
         elif self.framework_name == 'epnet':
-            self.framework = EPNetFramework(
-                features, domain_num, extractor=extractor,
-                bottom_params=bottom_params, tower_params=tower_params,
-                **extractor_kwargs
+            sce_features = [f for f in features if f.name == 'domain_indicator']
+            agn_features = [f for f in features if f.name != 'domain_indicator']
+            if not sce_features:
+                raise ValueError(
+                    "ADLS with framework='epnet' requires a SparseFeature named "
+                    "'domain_indicator' in `features` to drive the scenario gate."
+                )
+            bp = bottom_params if bottom_params is not None else {"dims": [128, 64, 32]}
+            self.framework = EPNet(
+                sce_features=sce_features,
+                agn_features=agn_features,
+                fcn_dims=bp["dims"],
+                extractor=extractor,
+                dropout=bp.get("dropout", 0.0),
+                **extractor_kwargs,
             )
         else:
             raise ValueError(f"Unknown framework: {framework}")
@@ -75,6 +92,11 @@ class ADLS(nn.Module):
 
     def _build_stage2_params(self, lora_rank, num_experts, k_layers, k_experts):
         num_layers = len(self.framework.backbone_layers)
+        if num_layers == 0:
+            raise RuntimeError(
+                "ADLS: framework exposed zero backbone_layers. Check that the "
+                "underlying SharedBottom/EPNet built a multi-layer deep network."
+            )
         self.num_lora_layers = num_layers
         self.num_experts = num_experts
         self.lora_rank = lora_rank

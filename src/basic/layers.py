@@ -6,13 +6,6 @@ from .features import DenseFeature, SparseFeature, SequenceFeature
 
 
 class PredictionLayer(nn.Module):
-    """Prediction Layer.
-
-    Args:
-        task_type (str): if `task_type='classification'`, then return sigmoid(x),
-                    change the input logits to probability. if`task_type='regression'`, then return x.
-    """
-
     def __init__(self, task_type='classification'):
         super(PredictionLayer, self).__init__()
         if task_type not in ["classification", "regression"]:
@@ -26,26 +19,6 @@ class PredictionLayer(nn.Module):
 
 
 class EmbeddingLayer(nn.Module):
-    """General Embedding Layer.
-    We save all the feature embeddings in embed_dict: `{feature_name : embedding table}`.
-
-
-    Args:
-        features (list): the list of `Feature Class`. It means all the features which we want to create an embedding table.
-
-    Shape:
-        - Input:
-            x (dict): {feature_name: feature_value}, sequence feature value is a 2D tensor with shape:`(batch_size, seq_len)`,\
-                      sparse/dense feature value is a 1D tensor with shape `(batch_size)`.
-            features (list): the list of `Feature Class`. It is means the current features which we want to do embedding lookup.
-            squeeze_dim (bool): whether to squeeze dim of output (default = `False`).
-        - Output:
-            - if input Dense: `(batch_size, num_features_dense)`.
-            - if input Sparse: `(batch_size, num_features, embed_dim)` or `(batch_size, num_features * embed_dim)`.
-            - if input Sequence: same with input sparse or `(batch_size, num_features_seq, seq_length, embed_dim)` when `pooling=="concat"`.
-            - if input Dense and Sparse/Sequence: `(batch_size, num_features_sparse * embed_dim)`. Note we must squeeze_dim for concat dense value with sparse embedding.
-    """
-
     def __init__(self, features):
         super().__init__()
         self.features = features
@@ -87,31 +60,29 @@ class EmbeddingLayer(nn.Module):
                         pooling_layer(self.embed_dict[fea.name](x[fea.name].long()), fea_mask).unsqueeze(1))
                 else:
                     sparse_emb.append(
-                        pooling_layer(self.embed_dict[fea.shared_with](x[fea.name].long()), fea_mask).unsqueeze(
-                            1))  # shared specific sparse feature embedding
+                        pooling_layer(self.embed_dict[fea.shared_with](x[fea.name].long()), fea_mask).unsqueeze(1))
             else:
-                dense_values.append(x[fea.name].float().unsqueeze(1))  # .unsqueeze(1).unsqueeze(1)
+                dense_values.append(x[fea.name].float().unsqueeze(1))
 
         if len(dense_values) > 0:
             dense_exists = True
             dense_values = torch.cat(dense_values, dim=1)
         if len(sparse_emb) > 0:
             sparse_exists = True
-            sparse_emb = torch.cat(sparse_emb, dim=1)  # [batch_size, num_features, embed_dim]
+            sparse_emb = torch.cat(sparse_emb, dim=1)
 
-        if squeeze_dim:  # Note: if the emb_dim of sparse features is different, we must squeeze_dim
-            if dense_exists and not sparse_exists:  # only input dense features
+        if squeeze_dim:
+            if dense_exists and not sparse_exists:
                 return dense_values
             elif not dense_exists and sparse_exists:
-                return sparse_emb.flatten(start_dim=1)  # squeeze dim to : [batch_size, num_features*embed_dim]
+                return sparse_emb.flatten(start_dim=1)
             elif dense_exists and sparse_exists:
-                return torch.cat((sparse_emb.flatten(start_dim=1), dense_values),
-                                 dim=1)  # concat dense value with sparse embedding
+                return torch.cat((sparse_emb.flatten(start_dim=1), dense_values), dim=1)
             else:
                 raise ValueError("The input features can note be empty")
         else:
             if sparse_exists:
-                return sparse_emb  # [batch_size, num_features, embed_dim]
+                return sparse_emb
             else:
                 raise ValueError(
                     "If keep the original shape:[batch_size, num_features, embed_dim], expected %s in feature list, got %s" %
@@ -119,18 +90,6 @@ class EmbeddingLayer(nn.Module):
 
 
 class InputMask(nn.Module):
-    """Return inputs mask from given features
-
-    Shape:
-        - Input:
-            x (dict): {feature_name: feature_value}, sequence feature value is a 2D tensor with shape:`(batch_size, seq_len)`,\
-                      sparse/dense feature value is a 1D tensor with shape `(batch_size)`.
-            features (list or SparseFeature or SequenceFeature): Note that the elements in features are either all instances of SparseFeature or all instances of SequenceFeature.
-        - Output:
-            - if input Sparse: `(batch_size, num_features)`
-            - if input Sequence: `(batch_size, num_features_seq, seq_length)`
-    """
-
     def __init__(self):
         super().__init__()
 
@@ -151,18 +110,6 @@ class InputMask(nn.Module):
 
 
 class LR(nn.Module):
-    """Logistic Regression Module. It is the one Non-linear
-    transformation for input feature.
-
-    Args:
-        input_dim (int): input size of Linear module.
-        sigmoid (bool): whether to add sigmoid function before output.
-
-    Shape:
-        - Input: `(batch_size, input_dim)`
-        - Output: `(batch_size, 1)`
-    """
-
     def __init__(self, input_dim, sigmoid=False):
         super().__init__()
         self.sigmoid = sigmoid
@@ -176,13 +123,6 @@ class LR(nn.Module):
 
 
 class ConcatPooling(nn.Module):
-    """Keep the origin sequence embedding shape
-
-    Shape:
-    - Input: `(batch_size, seq_length, embed_dim)`
-    - Output: `(batch_size, seq_length, embed_dim)`
-    """
-
     def __init__(self):
         super().__init__()
 
@@ -191,15 +131,6 @@ class ConcatPooling(nn.Module):
 
 
 class AveragePooling(nn.Module):
-    """Pooling the sequence embedding matrix by `mean`.
-
-    Shape:
-        - Input
-            x: `(batch_size, seq_length, embed_dim)`
-            mask: `(batch_size, 1, seq_length)`
-        - Output: `(batch_size, embed_dim)`
-    """
-
     def __init__(self):
         super().__init__()
 
@@ -213,15 +144,6 @@ class AveragePooling(nn.Module):
 
 
 class SumPooling(nn.Module):
-    """Pooling the sequence embedding matrix by `sum`.
-
-    Shape:
-        - Input
-            x: `(batch_size, seq_length, embed_dim)`
-            mask: `(batch_size, 1, seq_length)`
-        - Output: `(batch_size, embed_dim)`
-    """
-
     def __init__(self):
         super().__init__()
 
@@ -233,22 +155,6 @@ class SumPooling(nn.Module):
 
 
 class MLP(nn.Module):
-    """Multi-Layer Perceptron Module, it is the most widely used module for
-    learning feature. Note we default add `BatchNorm1d` and `Activation`
-    `Dropout` for each `Linear` Module.
-
-    Args:
-        input dim (int): input size of the first Linear Layer.
-        output_layer (bool): whether this MLP module is the output layer. If `True`, then append one Linear(*,1) module.
-        dims (list): output size of Linear Layer (default=[]).
-        dropout (float): probability of an element to be zeroed (default = 0.5).
-        activation (str): the activation function, support `[sigmoid, relu, prelu, dice, softmax]` (default='relu').
-
-    Shape:
-        - Input: `(batch_size, input_dim)`
-        - Output: `(batch_size, 1)` or `(batch_size, dims[-1])`
-    """
-
     def __init__(self, input_dim, output_layer=True, dims=None, dropout=0, activation="relu"):
         super().__init__()
         if dims is None:
@@ -256,7 +162,7 @@ class MLP(nn.Module):
         layers = list()
         for i_dim in dims:
             layers.append(nn.Linear(input_dim, i_dim))
-            layers.append(nn.BatchNorm1d(i_dim))
+            layers.append(nn.LayerNorm(i_dim))
             layers.append(activation_layer(activation))
             layers.append(nn.Dropout(p=dropout))
             input_dim = i_dim
@@ -269,15 +175,6 @@ class MLP(nn.Module):
 
 
 class Pruner(nn.Module):
-    """The Domain-adaptive Pruner， mentioned in the `AdaSparse paper
-    <https://dl.acm.org/doi/pdf/10.1145/3511808.3557541>`. It is used
-    to generate pruners for mlp layers
-
-    Args:
-
-    Shape:
-    """
-
     def __init__(self, sce_dims, agn_dims, form='Binarization', epsilon=1e-2, beta=2.0):
         super().__init__()
         if form not in ['Binarization', 'Scaling', 'Fusion']:
@@ -322,23 +219,7 @@ class GateNU(nn.Module):
         return out_layer * self.gemma
 
 
-# =============================================================================
-# Non-FCN feature extractors used by the ALoHA-Rec Framework wrappers when
-# extractor != 'fcn'. These are NEW classes and do NOT modify any pre-existing
-# class above.
-#
-# Each extractor exposes:
-#   * feature_dim      : output dim fed to the downstream head
-#   * backbone_layers  : list of nn.Linear eligible for LoRA injection & GABA
-#   * forward(x_flat, emb_3d=None) -> (features, aux_logit)
-# =============================================================================
-
-
 class DeepFMExtractor(nn.Module):
-    """DeepFM extractor: FM first-order + second-order (aux logit) +
-    Deep Network (feature trunk). Deep Linear layers are exposed for LoRA.
-    """
-
     def __init__(self, input_dim, deep_dims=None, dropout=0.2,
                  num_fields=None, embed_dim=None, **kwargs):
         super().__init__()
@@ -353,11 +234,11 @@ class DeepFMExtractor(nn.Module):
 
         dims = [input_dim] + list(deep_dims)
         self.deep_layers = nn.ModuleList()
-        self.bn_layers = nn.ModuleList()
+        self.norm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
         for i in range(len(dims) - 1):
             self.deep_layers.append(nn.Linear(dims[i], dims[i + 1]))
-            self.bn_layers.append(nn.BatchNorm1d(dims[i + 1]))
+            self.norm_layers.append(nn.LayerNorm(dims[i + 1]))
             self.dropout_layers.append(nn.Dropout(dropout))
 
     @property
@@ -382,18 +263,13 @@ class DeepFMExtractor(nn.Module):
         h = x
         for i in range(len(self.deep_layers)):
             h = self.deep_layers[i](h)
-            h = self.bn_layers[i](h)
+            h = self.norm_layers[i](h)
             h = F.relu(h)
             h = self.dropout_layers[i](h)
         return h, aux
 
 
 class DCNExtractor(nn.Module):
-    """DCN extractor: Cross Network (side branch) + Deep Network.
-    Output is concat(cross_last, deep_last). Deep Linear layers are exposed
-    for LoRA; cross layers are not routed (they are a side branch).
-    """
-
     def __init__(self, input_dim, num_cross_layers=3, deep_dims=None, dropout=0.2, **kwargs):
         super().__init__()
         if deep_dims is None:
@@ -413,11 +289,11 @@ class DCNExtractor(nn.Module):
 
         dims = [input_dim] + list(deep_dims)
         self.deep_layers = nn.ModuleList()
-        self.bn_layers = nn.ModuleList()
+        self.norm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
         for i in range(len(dims) - 1):
             self.deep_layers.append(nn.Linear(dims[i], dims[i + 1]))
-            self.bn_layers.append(nn.BatchNorm1d(dims[i + 1]))
+            self.norm_layers.append(nn.LayerNorm(dims[i + 1]))
             self.dropout_layers.append(nn.Dropout(dropout))
 
     @property
@@ -438,7 +314,7 @@ class DCNExtractor(nn.Module):
         h = x
         for i in range(len(self.deep_layers)):
             h = self.deep_layers[i](h)
-            h = self.bn_layers[i](h)
+            h = self.norm_layers[i](h)
             h = F.relu(h)
             h = self.dropout_layers[i](h)
 
@@ -448,8 +324,6 @@ class DCNExtractor(nn.Module):
 
 
 class _CIN(nn.Module):
-    """Compressed Interaction Network used by xDeepFMExtractor."""
-
     def __init__(self, num_fields, cin_layer_sizes, split_half=True):
         super().__init__()
         self.num_fields = num_fields
@@ -484,10 +358,6 @@ class _CIN(nn.Module):
 
 
 class xDeepFMExtractor(nn.Module):
-    """xDeepFM extractor: Linear term + CIN (aux logit) + Deep Network.
-    Deep Linear layers are exposed for LoRA.
-    """
-
     def __init__(self, input_dim, cin_layer_sizes=None, deep_dims=None,
                  dropout=0.2, num_fields=None, embed_dim=None, **kwargs):
         super().__init__()
@@ -512,11 +382,11 @@ class xDeepFMExtractor(nn.Module):
 
         dims = [input_dim] + list(deep_dims)
         self.deep_layers = nn.ModuleList()
-        self.bn_layers = nn.ModuleList()
+        self.norm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
         for i in range(len(dims) - 1):
             self.deep_layers.append(nn.Linear(dims[i], dims[i + 1]))
-            self.bn_layers.append(nn.BatchNorm1d(dims[i + 1]))
+            self.norm_layers.append(nn.LayerNorm(dims[i + 1]))
             self.dropout_layers.append(nn.Dropout(dropout))
 
     @property
@@ -535,18 +405,13 @@ class xDeepFMExtractor(nn.Module):
         h = x
         for i in range(len(self.deep_layers)):
             h = self.deep_layers[i](h)
-            h = self.bn_layers[i](h)
+            h = self.norm_layers[i](h)
             h = F.relu(h)
             h = self.dropout_layers[i](h)
         return h, aux
 
 
 class AutoIntExtractor(nn.Module):
-    """AutoInt extractor: stacked multi-head self-attention over per-field
-    embeddings + Deep Network. Deep Linear layers are exposed for LoRA.
-    Attention runs only when emb_3d (per-field embedding) is provided.
-    """
-
     def __init__(self, input_dim, deep_dims=None, dropout=0.2,
                  num_heads=2, num_attention_layers=2,
                  num_fields=None, embed_dim=None, **kwargs):
@@ -557,6 +422,14 @@ class AutoIntExtractor(nn.Module):
         self.num_fields = num_fields
         self.embed_dim = embed_dim
         self.num_attention_layers = int(num_attention_layers)
+
+        # Linear shortcut (first-order term). Present in the original AutoInt
+        # paper (Song et al. 2019). Without it, AutoInt has no direct path
+        # from input to logit — training starts from sigmoid(0)=0.5 and the
+        # signal must squeeze through 2 attention layers + 3 deep layers +
+        # zero-init output_layer. This mirrors DeepFM.fm_first_order /
+        # xDeepFM.linear.
+        self.linear = nn.Linear(input_dim, 1)
 
         if num_fields is not None and embed_dim is not None:
             self.attention_dim = (embed_dim // num_heads) * num_heads
@@ -572,20 +445,20 @@ class AutoIntExtractor(nn.Module):
             self.attention_norms = nn.ModuleList([
                 nn.LayerNorm(self.attention_dim) for _ in range(self.num_attention_layers)
             ])
-            attn_out_dim = num_fields * self.attention_dim
+            deep_input_dim = num_fields * self.attention_dim + input_dim
         else:
             self.proj = None
             self.attention_layers = None
             self.attention_norms = None
-            attn_out_dim = input_dim
+            deep_input_dim = input_dim
 
-        dims = [attn_out_dim] + list(deep_dims)
+        dims = [deep_input_dim] + list(deep_dims)
         self.deep_layers = nn.ModuleList()
-        self.bn_layers = nn.ModuleList()
+        self.norm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
         for i in range(len(dims) - 1):
             self.deep_layers.append(nn.Linear(dims[i], dims[i + 1]))
-            self.bn_layers.append(nn.BatchNorm1d(dims[i + 1]))
+            self.norm_layers.append(nn.LayerNorm(dims[i + 1]))
             self.dropout_layers.append(nn.Dropout(dropout))
 
         self._feature_dim = deep_dims[-1]
@@ -599,32 +472,28 @@ class AutoIntExtractor(nn.Module):
         return list(self.deep_layers)
 
     def forward(self, x, emb_3d=None):
+        aux = self.linear(x).squeeze(-1)
+
         if self.attention_layers is not None and emb_3d is not None:
             a = emb_3d if self.proj is None else self.proj(emb_3d)
             for i in range(self.num_attention_layers):
                 residual = a
                 a, _ = self.attention_layers[i](a, a, a)
                 a = self.attention_norms[i](a + residual)
-            h = a.flatten(start_dim=1)
+            h = torch.cat([a.flatten(start_dim=1), x], dim=1)
         else:
             h = x
 
         for i in range(len(self.deep_layers)):
             h = self.deep_layers[i](h)
-            h = self.bn_layers[i](h)
+            h = self.norm_layers[i](h)
             h = F.relu(h)
             h = self.dropout_layers[i](h)
-        aux = torch.zeros(h.shape[0], device=h.device)
         return h, aux
 
 
 def build_extractor(name, input_dim, num_fields=None, embed_dim=None,
                     deep_dims=None, dropout=0.2, **kwargs):
-    """Factory for non-FCN extractors.
-
-    Returns an extractor whose `forward(x_flat, emb_3d)` yields
-    `(features, aux_logit)`.
-    """
     name = name.lower()
     if name == 'deepfm':
         return DeepFMExtractor(input_dim, deep_dims=deep_dims, dropout=dropout,

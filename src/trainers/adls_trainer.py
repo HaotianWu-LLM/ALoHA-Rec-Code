@@ -48,6 +48,25 @@ class ALoHATrainer(object):
 
         self.evaluate_fn = roc_auc_score
 
+        self.stage1_R = None
+        self.stage2_R = None
+
+    def _print_and_save_R(self, R, stage_tag):
+        """Pretty-print R and save as .pt with dataset + stage + timestamp."""
+        R_cpu = R.detach().cpu()
+        M = R_cpu.shape[0]
+        print(f"\n[{stage_tag}] benefit matrix R ({M}x{M}):")
+        for i in range(M):
+            row = "  " + "  ".join(f"{R_cpu[i, j].item():+.4f}" for j in range(M))
+            print(row)
+
+        os.makedirs(self.model_path, exist_ok=True)
+        ts = time.strftime('%m_%d_%H_%M', time.localtime())
+        fname = f"R_{self.data_set_type}_{stage_tag}_{ts}.pt"
+        fpath = os.path.join(self.model_path, fname)
+        torch.save(R_cpu, fpath)
+        print(f"[{stage_tag}] saved R matrix to: {fpath}")
+
     def _collect_domain_gradients(self, x_dict, y, criterion):
         was_training = self.model.training
         self.model.eval()
@@ -95,6 +114,7 @@ class ALoHATrainer(object):
         )
         criterion = nn.BCELoss()
         early_stopper = EarlyStopper(patience=self.stage1_earlystop_patience)
+        early_stopped = False
 
         for epoch_i in range(self.stage1_n_epoch):
             print('stage1 epoch:', epoch_i)
@@ -134,13 +154,21 @@ class ALoHATrainer(object):
                 if early_stopper.stop_training(auc, self.model.state_dict()):
                     print(f'stage1 validation: best auc: {early_stopper.best_auc}')
                     self.model.load_state_dict(early_stopper.best_weights)
+                    early_stopped = True
                     break
+
+        if (not early_stopped) and val_loader is not None and early_stopper.best_weights is not None:
+            print(f'stage1 finished without early-stop. Loading best weights '
+                  f'(best val auc: {early_stopper.best_auc}) before computing R.')
+            self.model.load_state_dict(early_stopper.best_weights)
 
         try:
             R = self.model.compute_benefit_matrix_from_ema()
             self.model.set_benefit_matrix(R)
-        except Exception:
-            pass
+            self.stage1_R = R.detach().cpu().clone()
+            self._print_and_save_R(R, stage_tag='stage1')
+        except Exception as e:
+            print(f'[stage1] Failed to compute/save R: {e}')
 
         metrics = {}
         if val_loader is not None:
@@ -213,6 +241,7 @@ class ALoHATrainer(object):
 
         criterion = nn.BCELoss()
         early_stopper = EarlyStopper(patience=self.stage2_earlystop_patience)
+        early_stopped = False
 
         domain_loaders = None
         try:
@@ -276,10 +305,23 @@ class ALoHATrainer(object):
                 if early_stopper.stop_training(auc, self.model.state_dict()):
                     print(f'stage2 validation: best auc: {early_stopper.best_auc}')
                     self.model.load_state_dict(early_stopper.best_weights)
+                    early_stopped = True
                     break
+
+        if (not early_stopped) and val_loader is not None and early_stopper.best_weights is not None:
+            print(f'stage2 finished without early-stop. Loading best weights '
+                  f'(best val auc: {early_stopper.best_auc}) before computing R.')
+            self.model.load_state_dict(early_stopper.best_weights)
 
         for p in self.model.parameters():
             p.requires_grad = True
+
+        try:
+            R_gated = self.model.compute_gated_R()
+            self.stage2_R = R_gated.detach().cpu().clone()
+            self._print_and_save_R(R_gated, stage_tag='stage2')
+        except Exception as e:
+            print(f'[stage2] Failed to compute/save R: {e}')
 
         metrics = {}
         if val_loader is not None:
